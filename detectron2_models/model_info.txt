@@ -1,0 +1,11 @@
+Each Line contains the following information separted by a semi-colon(;)
+Trained Detectron2 Model name
+List of Classes
+List of name of mesh folders
+
+campbell; ["campbell"]; ["campbell"]
+Marker; ["marker"]; ["18_large_marker"]
+medical_objects; ["Stethoscope", "black_gauze", "blue_bottle", "closed_syringe", "glove_packet", "insulin", "open_syringe", "oxygen_mask", "scissor", "spray_bottle", "white_gauze"]; ["004_sugar_box", "005_tomato_soup_can", "004_sugar_box", "005_tomato_soup_can", "packet_small", "005_tomato_soup_can", "004_sugar_box", "005_tomato_soup_can", "scissor", "005_tomato_soup_can", "004_sugar_box"]
+Stethoscope; ["", "diaphragm", "ear_tube"]; [""]
+cart_handle; ["cart_handle"]; ["cart_handle"]
+medical_objects_fruits; ["apple", "banana", "black_gauze", "blue_bottle", "closed_syringe", "glove_packet", "insulin", "ketchup", "lemon", "open_syringe", "orange", "oxygen_mask", "pear", "plum", "sb_cup", "scissor", "spray_bottle", "stethoscope", "strawberry", "tray", "white_gauze", "yogurt"]; ["Apple", "Banana", "", "", "", "", "", "Ketchup", "", "", "Orange", "", "", "", "Sb_Cup", "", "", "", "", "Meal_Tray", "", "Yogurt"]
