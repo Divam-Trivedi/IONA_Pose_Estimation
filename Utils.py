@@ -7,9 +7,8 @@ from estimater import *
 from datareader import *
 from FP_Utils import *
 
-import distutils.core
-dist = distutils.core.run_setup("./detectron2/setup.py")
-pkgs = ' '.join([f"'{x}'" for x in dist.install_requires])
+script_directory = pathlib.Path(__file__).parent.resolve()
+
 sys.path.insert(0, os.path.abspath('./detectron2'))
 
 import logging
@@ -60,7 +59,7 @@ def get_mask(image, model):
 
     
 def parse_model_info(model_name):
-    f = open("/home/hirolab/divam/FoundationPose/Detectron2_Data/Detectron2_models/model_info.txt", 'r')
+    f = open(f"{script_directory}/detectron2_models/model_info.txt", 'r')
     lines = f.readlines()
     for line in lines:
         if line.startswith(model_name):
@@ -138,7 +137,7 @@ def setup_estimator_for_object(obj_name, mesh_names, all_classes, K, ROOT):
     mesh_name = mesh_names[mesh_idx]
 
     # Use original mesh folder directly, do NOT copy or modify anything
-    mesh_file = pathlib.Path("/home/hirolab/divam/FoundationPose/FoundationPose/Meshes") / mesh_name / "textured_simple.obj"
+    mesh_file = pathlib.Path(f"{script_directory}/Meshes") / mesh_name / "textured_simple.obj"
     if not mesh_file.exists():
         raise FileNotFoundError(f"Mesh file does not exist: {mesh_file}")
 
@@ -147,7 +146,7 @@ def setup_estimator_for_object(obj_name, mesh_names, all_classes, K, ROOT):
     refiner = PoseRefinePredictor()
 
     # Create debug folder inside output folder (only for logging)
-    debug_dir = ROOT / obj_name / 'debug'
+    debug_dir = ROOT / 'debug'
     debug_dir.mkdir(parents=True, exist_ok=True)
 
     est = FoundationPose(
