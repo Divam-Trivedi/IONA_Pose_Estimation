@@ -2,6 +2,17 @@ import cv2, numpy as np, os, pathlib, pyrealsense2 as rs, time, sys
 import os, sys, time, trimesh, logging
 from ultralytics import YOLO
 
+# persistence threshold (change to 3 or 5)
+PERSISTENCE_THRESHOLD = 5
+
+# IoU and depth thresholds for matching
+IOU_MATCH_THRESHOLD = 0.35
+DEPTH_MATCH_THRESHOLD_M = 0.06  # 6 cm tolerance
+
+# random color for debug if needed:
+YELLOW = (0, 255, 255)
+GREEN  = (0, 255, 0)
+
 # sys.path.append(f'/home/hirolab/divam/FoundationPose/FoundationPose')
 from estimater import *
 from datareader import *
@@ -80,7 +91,7 @@ def build_detector(dataset_name, num_classes, class_names, model_path):
     predictor = DefaultPredictor(cfg)
     return predictor
 
-def capture_frames_in_memory(align, pipe, num_frames, predictor, dataset_name, target_classes):
+def capture_frames_in_memory(align, pipe, num_frames, predictor, dataset_name, target_classes, intrinsics):
     frames_rgb, frames_depth, masks_per_frame = [], [], []
 
     captured = 0
@@ -97,39 +108,108 @@ def capture_frames_in_memory(align, pipe, num_frames, predictor, dataset_name, t
         metadata = MetadataCatalog.get(dataset_name)
         class_names = metadata.thing_classes
 
-        mask_dict = {}
-        for i, class_id in enumerate(pred_classes):
-            class_name = class_names[class_id]
-            if class_name in target_classes:
-                mask_dict[class_name] = (pred_masks[i].astype(np.uint8) * 255)
+        # before loop:
+        persistent_objects = {}
+        _next_instance_idx = defaultdict(int)
+        frame_idx = 0
 
-        if len(mask_dict) == 0:
-            # Show live frame with info
-            # cv2.imshow("RGB", rgb)
-            # cv2.waitKey(1)
-            continue
+        # inside the while captured < num_frames loop, after you have outputs, pred_masks, class names:
+        # build current detections list
+        curr_instances = []
+        for i in range(len(pred_classes)):
+            cname = class_names[pred_classes[i]]
+            if cname not in target_classes:
+                continue
+            mask = (pred_masks[i].astype(np.uint8) * 255)
+            cen = mask_centroid(mask)
+            # compute median depth in meters using depth array you have: 'depth' here is taken from current frame earlier
+            # convert depth pixels to meters: depth * MM_PER_UNIT / 1000.0 (your capture_frames_in_memory uses depth directly, ensure conversion)
+            median_depth = None
+            K, MM_PER_UNIT, align, pipe = list(intrinsics.values())
+            try:
+                median_depth = mask_median_depth(mask, depth.astype(np.float32) * MM_PER_UNIT / 1000.0)
+            except Exception:
+                median_depth = None
+            curr_instances.append({'class': cname, 'mask': mask, 'centroid': cen, 'depth': median_depth})
 
-        # Show overlay for user
+        # make prev_instances list from persistent_objects in fixed order
+        prev_instances = []
+        prev_ids = []
+        for pid, info in persistent_objects.items():
+            prev_instances.append({'id': pid, 'class': info['class'], 'mask': info['last_mask'], 'depth': info.get('last_depth')})
+            prev_ids.append(pid)
+
+        # match
+        assigns, unmatched_prev, unmatched_curr = match_detections(prev_instances, curr_instances)
+
+        # prepare mapping from curr index -> instance_id
+        curr_to_id = {}
+
+        # apply assignments
+        for pi, ci in assigns:
+            pid = prev_ids[pi]
+            curr_to_id[ci] = pid
+            # update persistent_objects but be careful to increment consec_count
+            persistent_objects[pid]['last_mask'] = curr_instances[ci]['mask']
+            persistent_objects[pid]['last_depth'] = curr_instances[ci]['depth']
+            persistent_objects[pid]['consec_count'] = persistent_objects[pid].get('consec_count', 0) + 1
+            persistent_objects[pid]['last_seen_frame'] = frame_idx
+
+        # handle unmatched current detections -> create new instance ids
+        for ci in unmatched_curr:
+            cname = curr_instances[ci]['class']
+            idx = _next_instance_idx[cname]
+            pid = f"{cname}_{idx}"
+            _next_instance_idx[cname] += 1
+            curr_to_id[ci] = pid
+            persistent_objects[pid] = {
+                'class': cname,
+                'last_mask': curr_instances[ci]['mask'],
+                'last_depth': curr_instances[ci]['depth'],
+                'consec_count': 1,
+                'last_seen_frame': frame_idx,
+                'estimator': None
+            }
+
+        # handle unmatched_prev -> reset consecutive count or mark not seen this frame
+        for pi in unmatched_prev:
+            pid = prev_ids[pi]
+            # If you want to require STRICT consecutive appearances, reset to 0:
+            persistent_objects[pid]['consec_count'] = 0
+            # alternatively, you might decrement slowly or keep last_seen_frame; choose reset for strict behavior
+
+        # build frame_instance_masks: dict instance_id -> mask
+        frame_instance_masks = {}
+        for ci, det in enumerate(curr_instances):
+            iid = curr_to_id.get(ci)
+            if iid is None:
+                continue
+            frame_instance_masks[iid] = det['mask']
+
+        # Optionally visualize overlays with colors by consec_count
         vis = rgb.copy()
-        for cname, mask in mask_dict.items():
-            mask_3ch = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-            vis = cv2.addWeighted(vis, 1.0, mask_3ch, 0.3, 0)
-            # Put class name
-            y, x = np.where(mask > 0)
-            if len(y) > 0:
-                cv2.putText(vis, cname, (x[0], y[0]-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+        for iid, mask in frame_instance_masks.items():
+            info = persistent_objects[iid]
+            color = GREEN if info['consec_count'] >= PERSISTENCE_THRESHOLD else YELLOW
+            mask_3ch = np.zeros_like(vis)
+            mask_3ch[mask > 0] = color
+            vis = cv2.addWeighted(vis, 1.0, mask_3ch, 0.35, 0)
+            ys, xs = np.where(mask > 0)
+            if len(ys) > 0:
+                cv2.putText(vis, f"{iid} ({info['consec_count']})", (xs[0], ys[0]-8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-        # cv2.imshow("RGB", vis)
-        # cv2.waitKey(1)
-
+        # then append:
         frames_rgb.append(rgb)
         frames_depth.append(depth)
-        masks_per_frame.append(mask_dict)
+        masks_per_frame.append(frame_instance_masks)
         captured += 1
+        frame_idx += 1
+
         print(f"Captured frame {captured}/{num_frames}")
 
     # cv2.destroyAllWindows()
-    return frames_rgb, frames_depth, masks_per_frame
+    return frames_rgb, frames_depth, masks_per_frame, persistent_objects
 
 def setup_estimator_for_object(obj_name, mesh_names, all_classes, K, ROOT):
     # Lookup mesh name
@@ -201,7 +281,7 @@ def capture_images(intrinsics, predictor, dataset_name, target_classes, MAX_FRAM
             exit()
     
     start_time = time.time()
-    frames_rgb, frames_depth, masks_per_frame = capture_frames_in_memory(align, pipe, num_frames, predictor, dataset_name, target_classes)
+    frames_rgb, frames_depth, masks_per_frame, persistent_objects = capture_frames_in_memory(align, pipe, num_frames, predictor, dataset_name, target_classes, intrinsics)
     pipe.stop()
 
     # collect all detected objects across frames
@@ -210,31 +290,31 @@ def capture_images(intrinsics, predictor, dataset_name, target_classes, MAX_FRAM
         detected_objects.update(mask_dict.keys())
     print("Detected objects to process:", detected_objects)
 
-    return frames_rgb, frames_depth, masks_per_frame, detected_objects, start_time
+    return frames_rgb, frames_depth, masks_per_frame, detected_objects, start_time, persistent_objects
 
-def estimate_pose(frames_rgb, frames_depth, masks_per_frame, detected_objects, intrinsics, mesh_names, all_classes, ROOT):
+def estimate_pose(frames_rgb, frames_depth, masks_per_frame, detected_objects, intrinsics, mesh_names, all_classes, ROOT, instance_to_class):
     K, MM_PER_UNIT, align, pipe = list(intrinsics.values())
     poses_per_frame = defaultdict(dict)   # poses_per_frame[frame_idx][obj_name] = 4x4 np.array
     meshes_in_use = {}  # meshes_in_use[obj_name] = trimesh object (loaded once)
     ests = {}  # optional cache of estimators per object
     # Run pose estimation per object
-    for obj_name in detected_objects:
-        est, mesh = setup_estimator_for_object(obj_name, mesh_names, all_classes, K, ROOT)
-        meshes_in_use[obj_name] = mesh
-        ests[obj_name] = est
-        output_dir = ROOT / obj_name / 'output'
-        output_dir.mkdir(exist_ok=True)
-
+    # inside estimate_pose: iterate instance ids
+    for instance_id in detected_objects:
+        class_name = instance_to_class[instance_id]  # e.g. 'apple'
+        est, mesh = setup_estimator_for_object(class_name, mesh_names, all_classes, K, ROOT)
+        # store by instance id:
+        meshes_in_use[instance_id] = mesh
+        ests[instance_id] = est
+        # then iterate frames and look for mask under this instance_id:
         for i, (rgb_frame, depth_frame, mask_dict) in enumerate(zip(frames_rgb, frames_depth, masks_per_frame)):
-            if obj_name not in mask_dict:
+            if instance_id not in mask_dict:
                 continue
-            mask = mask_dict[obj_name]
+            mask = mask_dict[instance_id]
             depth_m = depth_frame.astype(np.float32) * MM_PER_UNIT / 1000.0
-            # Register first frame, track for rest
             pose = est.register(K=K, rgb=rgb_frame, depth=depth_m, ob_mask=mask.astype(bool), iteration=5) \
-                if i==0 else est.track_one(rgb=rgb_frame, depth=depth_m, K=K, iteration=2)
-            poses_per_frame[i][obj_name] = np.array(pose, dtype=np.float64)
-            print("The pose of", obj_name, "is", poses_per_frame[i][obj_name])
+                    if i==0 else est.track_one(rgb=rgb_frame, depth=depth_m, K=K, iteration=2)
+            poses_per_frame[i][instance_id] = np.array(pose, dtype=np.float64)
+            print("The pose of", class_name, "is", poses_per_frame[i][instance_id])
 
     end_time = time.time()
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -279,7 +359,7 @@ def save_combined_results(frames_rgb, masks_per_frame, poses_per_frame, meshes_i
             color = tuple(np.random.randint(0, 255, 3).tolist())
 
             # draw XYZ axes at object pose (standard RGB)
-            theta = np.deg2rad(-90)
+            theta = np.deg2rad(90)
             T_blender = np.array([
                 [1, 0, 0],
                 [0, np.cos(theta), -np.sin(theta)],
@@ -388,6 +468,204 @@ def save_combined_results(frames_rgb, masks_per_frame, poses_per_frame, meshes_i
 
     print(f"Wrote results summary to {results_path}")
 
+def mask_iou(maskA, maskB):
+    # maskA, maskB: uint8 masks with non-zero = object
+    a = (maskA > 0)
+    b = (maskB > 0)
+    inter = np.logical_and(a, b).sum()
+    union = np.logical_or(a, b).sum()
+    if union == 0:
+        return 0.0
+    return inter / float(union)
+
+def mask_centroid(mask):
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0:
+        return None
+    return (int(np.mean(xs)), int(np.mean(ys)))
+
+def mask_median_depth(mask, depth_frame):
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0:
+        return None
+    vals = depth_frame[ys, xs].astype(np.float32)
+    # depth_frame expected in same units as your MM_PER_UNIT usage (we will compare in meters)
+    return float(np.median(vals))
+
+def match_detections(prev_instances, curr_instances):
+    """
+    prev_instances: list of dicts each {'id': 'apple_0', 'class': 'apple', 'mask': mask, 'depth': z_m}
+    curr_instances: list of dicts each {'class':..., 'mask':..., 'depth': z_m}
+    Returns: list of assignments [(prev_idx, curr_idx), ...], unmatched_prev_idxs, unmatched_curr_idxs
+    """
+    assignments = []
+    prev_assigned = set()
+    curr_assigned = set()
+
+    # compute IoU matrix only for same-class pairs
+    scores = []
+    for pi, p in enumerate(prev_instances):
+        for ci, c in enumerate(curr_instances):
+            if p['class'] != c['class']:
+                continue
+            iou = mask_iou(p['mask'], c['mask'])
+            depth_ok = True
+            if p.get('depth') is not None and c.get('depth') is not None:
+                depth_ok = abs(p['depth'] - c['depth']) <= DEPTH_MATCH_THRESHOLD_M
+            score = iou if depth_ok else iou * 0.5
+            scores.append((score, pi, ci))
+
+    # sort descending and greedily match if above IOU threshold
+    scores.sort(reverse=True, key=lambda x: x[0])
+    for score, pi, ci in scores:
+        if score < IOU_MATCH_THRESHOLD:
+            break
+        if pi in prev_assigned or ci in curr_assigned:
+            continue
+        assignments.append((pi, ci))
+        prev_assigned.add(pi)
+        curr_assigned.add(ci)
+
+    unmatched_prev = [i for i in range(len(prev_instances)) if i not in prev_assigned]
+    unmatched_curr = [i for i in range(len(curr_instances)) if i not in curr_assigned]
+    return assignments, unmatched_prev, unmatched_curr
+
+
+import cv2
+import numpy as np
+from collections import deque, defaultdict
+import time
+
+# ----------------- GUI capture with persistence & right-panel selection ---------------
+
+PERSISTENCE_THRESHOLD_FRAMES = 3    # change to 3 or 5 as you like
+IOU_MATCH_THRESHOLD = 0.30
+DEPTH_MATCH_THRESHOLD_M = 0.06  # meters tolerance for depth matching
+
+def mask_iou(maskA, maskB):
+    a = (maskA > 0)
+    b = (maskB > 0)
+    inter = np.logical_and(a, b).sum()
+    union = np.logical_or(a, b).sum()
+    return float(inter) / float(union) if union > 0 else 0.0
+
+def mask_centroid(mask):
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0:
+        return None
+    return int(np.mean(xs)), int(np.mean(ys))
+
+def mask_median_depth(mask, depth_frame_m):
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0:
+        return None
+    vals = depth_frame_m[ys, xs].astype(np.float32)
+    return float(np.median(vals)) if vals.size > 0 else None
+
+def match_detections(prev_instances, curr_instances):
+    """
+    prev_instances: list of dicts {'id':..., 'class':..., 'mask':..., 'depth':...}
+    curr_instances: list of dicts {'class':..., 'mask':..., 'depth':...}
+    Greedy matching by IoU (only same class).
+    """
+    scores = []
+    for pi, p in enumerate(prev_instances):
+        for ci, c in enumerate(curr_instances):
+            if p['class'] != c['class']:
+                continue
+            iou = mask_iou(p['mask'], c['mask'])
+            depth_ok = True
+            if p.get('depth') is not None and c.get('depth') is not None:
+                depth_ok = abs(p['depth'] - c['depth']) <= DEPTH_MATCH_THRESHOLD_M
+            score = iou if depth_ok else iou * 0.5
+            scores.append((score, pi, ci))
+    scores.sort(reverse=True, key=lambda x: x[0])
+    prev_assigned = set(); curr_assigned = set(); assignments = []
+    for score, pi, ci in scores:
+        if score < IOU_MATCH_THRESHOLD:
+            continue
+        if pi in prev_assigned or ci in curr_assigned:
+            continue
+        assignments.append((pi, ci))
+        prev_assigned.add(pi); curr_assigned.add(ci)
+    unmatched_prev = [i for i in range(len(prev_instances)) if i not in prev_assigned]
+    unmatched_curr = [i for i in range(len(curr_instances)) if i not in curr_assigned]
+    return assignments, unmatched_prev, unmatched_curr
+
+def capture_images_gui(intrinsics, predictor, dataset_name, target_classes, MAX_FRAMES=5, BUFFER_SIZE=5):
+    """
+    Live GUI capture:
+      - continuously detects & matches instances
+      - maintains persistent_objects with consec_count
+      - shows right-side panel only for objects with consec_count >= PERSISTENCE_THRESHOLD_FRAMES
+      - user clicks checkboxes for selection, presses ENTER to freeze (returns buffered frames around that moment)
+    Returns:
+      frames_rgb (list of buffered frames), frames_depth (list), masks_per_frame (list of dicts instance_id->mask),
+      detected_objects (set of instance IDs selected), start_time, persistent_objects (dict)
+    """
+    K, MM_PER_UNIT, align, pipe = list(intrinsics.values())
+
+    # Buffers
+    rgb_buf = deque(maxlen=BUFFER_SIZE)
+    depth_buf = deque(maxlen=BUFFER_SIZE)
+    maskbuf_buf = deque(maxlen=BUFFER_SIZE)  # each element: dict of instance_id -> mask for that frame (temporary)
+    start_time = time.time()
+
+    # persistent tracking
+    persistent_objects = {}   # instance_id -> info dict
+    _next_instance_idx = defaultdict(int)
+    prev_instances_for_match = []  # list of {'id','class','mask','depth'}
+
+    cv2.namedWindow("Live", cv2.WINDOW_NORMAL)
+    # panel params
+    PANEL_WIDTH = 300
+    ROW_H = 34
+    PADDING = 12
+
+    locked = False
+    selected_for_export = {}  # instance_id -> bool
+
+    frame_idx = 0
+    print('GUI: Press ENTER to freeze & export selected persistent objects. Press Q to quit.')
+
+    while True:
+        frames = align.process(pipe.wait_for_frames())
+        rgb = np.asanyarray(frames.get_color_frame().get_data())
+        depth = np.asanyarray(frames.get_depth_frame().get_data())  # raw depth units
+        depth_m = depth.astype(np.float32) * MM_PER_UNIT / 1000.0  # convert to meters
+
+        outputs = predictor(rgb)
+        instances = outputs["instances"]
+        pred_classes = instances.pred_classes.cpu().numpy()
+        pred_masks = instances.pred_masks.cpu().numpy()
+        metadata = MetadataCatalog.get(dataset_name)
+        class_names = metadata.thing_classes
+
+        # Build curr_instances list
+        curr_instances = []
+        for i, class_id in enumerate(pred_classes):
+            cname = class_names[class_id]
+            if cname not in target_classes:
+                continue
+            mask = (pred_masks[i].astype(np.uint8) * 255)
+            cen = mask_centroid(mask)
+            med_depth = mask_median_depth(mask, depth_m)
+            curr_instances.append({'class': cname, 'mask': mask, 'centroid': cen, 'depth': med_depth})
+
+        # Match to previous persistent instances
+        assignments, unmatched_prev, unmatched_curr = match_detections(prev_instances_for_match, curr_instances)
+
+        # Build mapping curr_idx -> instance_id
+        curr_to_id = {}
+        prev_ids = [p['id'] for p in prev_instances_for_match]
+
+        # apply assignments - update persistent_objects
+        for pi, ci in assignments:
+            pid = prev_ids[pi]
+            curr_to_id[ci] = pid
+            persistent_objects[pid]['last_mask'] = curr_instances[ci]['mask']
+            persistent_objects[pid]['last_depth'] = curr_instances[ci]['depth']
+            persistent_objects[pid]['consec_count'] = persistent_objects[pid].get('consec_count', 0) + 1
 
 
 ### MATHS ####
