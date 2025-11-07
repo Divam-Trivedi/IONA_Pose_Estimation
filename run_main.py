@@ -17,9 +17,15 @@ def main():
     predictor = build_detector(dataset_name, len(all_classes), all_classes,
                                model_path=f"{script_directory}/detectron2_models/{model_name}.pth")
     
-    frames_rgb, frames_depth, masks_per_frame, detected_objects, start_time = capture_images(camera_intrinsics, predictor, dataset_name, target_classes, MAX_FRAMES=MAX_FRAMES_DEFAULT)
+    frames_rgb, frames_depth, masks_per_frame, detected_objects, start_time, persistent_objects = capture_images(camera_intrinsics, predictor, dataset_name, target_classes, MAX_FRAMES=MAX_FRAMES_DEFAULT)
     
-    end_time = estimate_pose(frames_rgb, frames_depth, masks_per_frame, detected_objects, camera_intrinsics, mesh_names, all_classes, ROOT)
+    detected_objects = set()
+    instance_to_class = {}
+    for frame_mask_dict in masks_per_frame:
+        for iid in frame_mask_dict.keys():
+            detected_objects.add(iid)
+            instance_to_class[iid] = persistent_objects[iid]['class']
+    end_time = estimate_pose(frames_rgb, frames_depth, masks_per_frame, detected_objects, camera_intrinsics, mesh_names, all_classes, ROOT, instance_to_class)
 
     print(f"Total processing time: {end_time - start_time:.2f} seconds for {len(detected_objects)} object(s)")
 
