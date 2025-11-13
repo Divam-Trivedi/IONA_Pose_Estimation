@@ -1,4 +1,4 @@
-# IONA Pose Estimation
+# Markerless 6D Pose Estimation
 
 A real-time 6D pose estimation system combining NVIDIA's FoundationPose and Meta's Detectron2 for robotic manipulation and object tracking applications.
 
